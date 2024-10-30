@@ -1,7 +1,9 @@
 package strongswan
 
 import (
+	"crypto/x509"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/strongswan/govici/vici"
@@ -55,6 +57,9 @@ type Collector struct {
 	saEstablishSecs *prometheus.Desc
 	saRekeySecs     *prometheus.Desc
 	saLifetimeSecs  *prometheus.Desc
+
+	crtCnt   *prometheus.Desc
+	crtValid *prometheus.Desc
 }
 
 func NewCollector(viciClientFn viciClientFn) *Collector {
@@ -198,6 +203,17 @@ func NewCollector(viciClientFn viciClientFn) *Collector {
 			"Seconds until the lifetime expires",
 			[]string{"ike_name", "ike_id", "child_name", "child_id"}, nil,
 		),
+
+		crtCnt: prometheus.NewDesc(
+			prefix+"crt_count",
+			"Number of X509 certificates",
+			nil, nil,
+		),
+		crtValid: prometheus.NewDesc(
+			prefix+"crt_valid",
+			"X509 certificate validity",
+			[]string{"subject", "not_before", "not_after"}, nil,
+		),
 	}
 }
 
@@ -230,6 +246,9 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.saEstablishSecs
 	ch <- c.saRekeySecs
 	ch <- c.saLifetimeSecs
+
+	ch <- c.crtCnt
+	ch <- c.crtValid
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
@@ -237,6 +256,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(
 			c.ikeCnt,
+			prometheus.GaugeValue,
+			float64(0),
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.crtCnt,
 			prometheus.GaugeValue,
 			float64(0),
 		)
@@ -253,6 +277,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			c.collectIkeChildMetrics(ikeSa.Name, ikeSa.UniqueID, child, ch)
 		}
 	}
+
+	crts, err := c.listCrts()
+	if err != nil {
+		ch <- prometheus.MustNewConstMetric(
+			c.crtCnt,
+			prometheus.GaugeValue,
+			float64(0),
+		)
+		return
+	}
+
+	c.collectCrtMetrics(crts, ch)
 }
 
 func (c *Collector) collectIkeMetrics(ikeSa IkeSa, ch chan<- prometheus.Metric) {
@@ -474,4 +510,76 @@ func viciStateToInt(v string) connectionStatus {
 	default:
 		return unknown
 	}
+}
+
+func (c *Collector) collectCrtMetrics(crts []Crt, ch chan<- prometheus.Metric) {
+	var x509_crts uint
+
+	for _, crt := range crts {
+		if crt.Type != "X509" {
+			continue
+		}
+
+		cert, err := x509.ParseCertificate([]byte(crt.Data))
+		if err != nil {
+			log.Logger.Warnf("Certificate parse error: %v", err)
+			continue
+		}
+
+		now := time.Now()
+		valid := 0
+		if now.After(cert.NotBefore) && now.Before(cert.NotAfter) {
+			valid = 1
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			c.crtValid,
+			prometheus.GaugeValue,
+			float64(valid),
+			cert.Subject.String(), cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339),
+		)
+
+		x509_crts++
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		c.crtCnt,
+		prometheus.GaugeValue,
+		float64(x509_crts),
+	)
+}
+
+func (c *Collector) listCrts() ([]Crt, error) {
+	s, err := c.viciClientFn()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+
+	req := vici.NewMessage()
+	req.Set("type", "X509")
+	req.Set("flag", "ANY")
+
+	msgs, err := s.StreamedCommandRequest("list-certs", "list-cert", req)
+	if err != nil {
+		return nil, err
+	}
+
+	res := []Crt{}
+	for _, m := range msgs {
+		if err = m.Err(); err != nil {
+			log.Logger.Warnf("Message error: %v", err)
+			return nil, err
+		}
+
+		var crt Crt
+		if e := vici.UnmarshalMessage(m, &crt); e != nil {
+			log.Logger.Warnf("Message unmarshal error: %v", e)
+			return nil, err
+		}
+
+		res = append(res, crt)
+	}
+
+	return res, nil
 }
