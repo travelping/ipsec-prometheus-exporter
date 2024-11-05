@@ -85,6 +85,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", "", "Path to the config file.")
 }
 
+// test
 func startServer(checkers []healthcheck.Option) {
 	log.Logger.Infof("Starting admin server on port '%v'.", cfg.Server.Port)
 
