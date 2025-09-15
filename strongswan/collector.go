@@ -58,8 +58,9 @@ type Collector struct {
 	saRekeySecs     *prometheus.Desc
 	saLifetimeSecs  *prometheus.Desc
 
-	crtCnt   *prometheus.Desc
-	crtValid *prometheus.Desc
+	crtCnt        *prometheus.Desc
+	crtValid      *prometheus.Desc
+	crtExpireSecs *prometheus.Desc
 }
 
 func NewCollector(viciClientFn viciClientFn) *Collector {
@@ -214,6 +215,11 @@ func NewCollector(viciClientFn viciClientFn) *Collector {
 			"X509 certificate validity",
 			[]string{"serial_number", "subject", "alternate_names", "not_before", "not_after"}, nil,
 		),
+		crtExpireSecs: prometheus.NewDesc(
+			prefix+"crt_expire_secs",
+			"Seconds until the X509 certificate expires",
+			[]string{"serial_number", "subject", "alternate_names", "not_before", "not_after"}, nil,
+		),
 	}
 }
 
@@ -249,6 +255,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 
 	ch <- c.crtCnt
 	ch <- c.crtValid
+	ch <- c.crtExpireSecs
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
@@ -558,6 +565,7 @@ func alternateNames(cert *x509.Certificate) string {
 func (c *Collector) collectCrtMetrics(crts []Crt, ch chan<- prometheus.Metric) {
 	var x509Crts uint
 
+	now := time.Now()
 	for _, crt := range crts {
 		if crt.Type != "X509" {
 			continue
@@ -569,21 +577,30 @@ func (c *Collector) collectCrtMetrics(crts []Crt, ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		now := time.Now()
 		valid := 0
 		if now.After(cert.NotBefore) && now.Before(cert.NotAfter) {
 			valid = 1
 		}
+		expire := cert.NotAfter.Sub(now).Seconds()
 
-		ch <- prometheus.MustNewConstMetric(
-			c.crtValid,
-			prometheus.GaugeValue,
-			float64(valid),
+		labels := []string{
 			cert.SerialNumber.String(),
 			cert.Subject.String(),
 			alternateNames(cert),
 			cert.NotBefore.Format(time.RFC3339),
 			cert.NotAfter.Format(time.RFC3339),
+		}
+		ch <- prometheus.MustNewConstMetric(
+			c.crtValid,
+			prometheus.GaugeValue,
+			float64(valid),
+			labels...,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.crtExpireSecs,
+			prometheus.GaugeValue,
+			float64(expire),
+			labels...,
 		)
 
 		x509Crts++
