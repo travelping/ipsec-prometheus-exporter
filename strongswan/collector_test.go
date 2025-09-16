@@ -8,14 +8,17 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/require"
 	"github.com/strongswan/govici/vici"
 )
@@ -27,6 +30,11 @@ type fakeViciClient struct {
 	crtsMsgs       []*vici.Message
 	closeTriggered int
 }
+
+const (
+	crtExpireTimeMetricName          = "strongswan_crt_expire_secs"
+	crtExpireAllowedDiffFromExpected = 60.0
+)
 
 func (fvc *fakeViciClient) StreamedCommandRequest(cmd string, event string, _ *vici.Message) ([]*vici.Message, error) {
 	if cmd == "list-sas" && event == "list-sa" {
@@ -410,27 +418,16 @@ func TestCollector_Metrics(t *testing.T) {
 			wantMetricsHelp:  "Number of X509 certificates",
 			wantMetricsType:  "gauge",
 			wantMetricsValue: 1,
-			wantMetricsCount: 3,
+			wantMetricsCount: 4,
 		},
 		{
-			name: "one cert count",
-			crtsMsgsModifierFn: func() []*vici.Message {
-				crtMsg := vici.NewMessage()
-				crtMsg.Set("type", "X509")
-
-				crt, err := createSingleX509Crt()
-				if err != nil {
-					return []*vici.Message{}
-				}
-
-				crtMsg.Set("data", string(crt))
-				return []*vici.Message{crtMsg}
-			},
-			metricName:       "strongswan_crt_count",
-			wantMetricsHelp:  "Number of X509 certificates",
-			wantMetricsType:  "gauge",
-			wantMetricsValue: 1,
-			wantMetricsCount: 3,
+			name:               "one cert count",
+			crtsMsgsModifierFn: singleCertViciMessages(createSingleX509Crt),
+			metricName:         "strongswan_crt_count",
+			wantMetricsHelp:    "Number of X509 certificates",
+			wantMetricsType:    "gauge",
+			wantMetricsValue:   1,
+			wantMetricsCount:   4,
 		},
 		{
 			name: "two cert count",
@@ -454,28 +451,27 @@ func TestCollector_Metrics(t *testing.T) {
 			wantMetricsHelp:  "Number of X509 certificates",
 			wantMetricsType:  "gauge",
 			wantMetricsValue: 2,
-			wantMetricsCount: 4,
+			wantMetricsCount: 6,
 		},
 		{
-			name: "cert valid",
-			crtsMsgsModifierFn: func() []*vici.Message {
-				crtMsg := vici.NewMessage()
-				crtMsg.Set("type", "X509")
-
-				crt, err := createSingleX509Crt()
-				if err != nil {
-					return []*vici.Message{}
-				}
-
-				crtMsg.Set("data", string(crt))
-				return []*vici.Message{crtMsg}
-			},
-			metricName:        "strongswan_crt_valid",
-			wantMetricsHelp:   "X509 certificate validity",
-			wantMetricsType:   "gauge",
-			wantMetricsLabels: `alternate_names="",not_after="2124-01-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
-			wantMetricsValue:  1,
-			wantMetricsCount:  3,
+			name:               "cert valid",
+			crtsMsgsModifierFn: singleCertViciMessages(createSingleX509Crt),
+			metricName:         "strongswan_crt_valid",
+			wantMetricsHelp:    "X509 certificate validity",
+			wantMetricsType:    "gauge",
+			wantMetricsLabels:  `alternate_names="",not_after="2124-01-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
+			wantMetricsValue:   1,
+			wantMetricsCount:   4,
+		},
+		{
+			name:               "cert expired",
+			crtsMsgsModifierFn: singleCertViciMessages(createExpiredX509Crt),
+			metricName:         "strongswan_crt_valid",
+			wantMetricsHelp:    "X509 certificate validity",
+			wantMetricsType:    "gauge",
+			wantMetricsLabels:  `alternate_names="",not_after="2024-12-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
+			wantMetricsValue:   0,
+			wantMetricsCount:   4,
 		},
 		{
 			name: "cert alternate names",
@@ -510,7 +506,7 @@ func TestCollector_Metrics(t *testing.T) {
 			wantMetricsType:   "gauge",
 			wantMetricsLabels: `alternate_names="DNS=test.org+DNS=test2.org,EM=Name1+EM=Name2,IP=192.168.0.1+IP=192.168.1.1,URI=https://test.org/foobar+URI=https://test2.org/foobar2",not_after="2124-01-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
 			wantMetricsValue:  1,
-			wantMetricsCount:  3,
+			wantMetricsCount:  4,
 		},
 	}
 	for _, tt := range tests {
@@ -750,6 +746,100 @@ func TestCollector_MetricsSaChild(t *testing.T) {
 	}
 }
 
+func TestCollector_MetricsCrtExpireTime(t *testing.T) {
+	tz, err := time.LoadLocation("UTC")
+	if err != nil {
+		t.Errorf("failed to load timezone: %s", err)
+	}
+
+	tests := []struct {
+		name               string
+		crtsMsgsModifierFn func() []*vici.Message
+		wantMetricsLabels  string
+		wantMetricsValue   float64
+	}{
+		{
+			name:               "cert expire time for valid cert",
+			crtsMsgsModifierFn: singleCertViciMessages(createSingleX509Crt),
+			wantMetricsLabels:  `alternate_names="",not_after="2124-01-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
+			wantMetricsValue:   time.Until(time.Date(2124, 1, 1, 12, 0, 0, 0, tz)).Seconds(),
+		},
+		{
+			name:               "cert expire time for expired cert",
+			crtsMsgsModifierFn: singleCertViciMessages(createExpiredX509Crt),
+			wantMetricsLabels:  `alternate_names="",not_after="2024-12-01T12:00:00Z",not_before="2024-01-01T12:00:00Z",serial_number="1",subject="CN=Test,O=Org1"`,
+			wantMetricsValue:   time.Until(time.Date(2024, 12, 1, 12, 0, 0, 0, tz)).Seconds(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			crtsMmsgs := []*vici.Message{}
+			if tt.crtsMsgsModifierFn != nil {
+				crtsMmsgs = tt.crtsMsgsModifierFn()
+			}
+			c := NewCollector(func() (ViciClient, error) {
+				return &fakeViciClient{
+						crtsMsgs: crtsMmsgs,
+					},
+					nil
+			})
+
+			cnt := testutil.CollectAndCount(c)
+			const wantMetricsCount = 4
+			require.Equal(t, wantMetricsCount, cnt, "metrics count")
+
+			metricBytes, err := testutil.CollectAndFormat(c, expfmt.TypeTextPlain, crtExpireTimeMetricName)
+			if err != nil {
+				t.Fatalf("unexpected collecting result of '%s':\n%s", crtExpireTimeMetricName, err)
+			}
+
+			metricStr := strings.TrimSpace(string(metricBytes))
+			validateMetricsCrtExpireTimeValue(t, metricStr, tt.wantMetricsValue)
+			validateMetricsCrtExpireTimeLabels(t, metricStr, tt.wantMetricsLabels)
+		})
+	}
+}
+
+func validateMetricsCrtExpireTimeValue(t *testing.T, metricStr string, wantMetricsValue float64) {
+	metricFields := strings.Split(metricStr, " ")
+	if len(metricFields) == 0 {
+		t.Fatalf("unexpected format of metric '%s': %s", crtExpireTimeMetricName, metricStr)
+	}
+
+	metricValStr := metricFields[len(metricFields)-1]
+	metricVal, err := strconv.ParseFloat(metricValStr, 64)
+	if err != nil {
+		t.Fatalf("failure in parsing of metric's value '%s': %s\n%s", crtExpireTimeMetricName, metricValStr, err)
+	}
+
+	require.GreaterOrEqual(t, crtExpireAllowedDiffFromExpected, math.Abs(metricVal-wantMetricsValue), "seconds till cert expires value")
+}
+
+func validateMetricsCrtExpireTimeLabels(t *testing.T, metricStr, wantMetricsLabels string) {
+	labels := strings.Split(metricStr, "{")
+	if len(labels) < 2 {
+		t.Fatalf("unexpected format of metric '%s': %s", crtExpireTimeMetricName, metricStr)
+	}
+
+	labels = strings.Split(labels[1], "}")
+	require.Equal(t, labels[0], wantMetricsLabels, "seconds till cert expires labels")
+}
+
+func singleCertViciMessages(createX509CrtFn func() ([]byte, error)) func() []*vici.Message {
+	return func() []*vici.Message {
+		crtMsg := vici.NewMessage()
+		crtMsg.Set("type", "X509")
+
+		crt, err := createX509CrtFn()
+		if err != nil {
+			return []*vici.Message{}
+		}
+
+		crtMsg.Set("data", string(crt))
+		return []*vici.Message{crtMsg}
+	}
+}
+
 func createSingleX509Crt() ([]byte, error) {
 	return createSingleX509CrtWithAlternateNames([]string{}, []string{}, []net.IP{}, []*url.URL{})
 }
@@ -806,6 +896,22 @@ func createDoubleX509Crt() ([]byte, []byte, error) {
 	}
 
 	return crt1, crt2, nil
+}
+
+func createExpiredX509Crt() ([]byte, error) {
+	tz, err := time.LoadLocation("UTC")
+	if err != nil {
+		return nil, err
+	}
+
+	return createX509Crt(
+		pkix.Name{
+			Organization: []string{"Org1"},
+			CommonName:   "Test",
+		},
+		time.Date(2024, 1, 1, 12, 0, 0, 0, tz),
+		time.Date(2024, 12, 1, 12, 0, 0, 0, tz),
+	)
 }
 
 func createX509Crt(subject pkix.Name, notBefore, notAfter time.Time) ([]byte, error) {
